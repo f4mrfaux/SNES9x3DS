@@ -1,0 +1,213 @@
+================================================================================
+                    STEREO RENDERING - QUICK REFERENCE CARD
+================================================================================
+
+INITIALIZATION (Do Once)
+========================
+gfxInitDefault();
+gfxSet3D(true);                                    // CRITICAL: Enable before targets!
+C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+
+C3D_RenderTarget* left = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, 
+                                                 GPU_RB_DEPTH24_STENCIL8);
+C3D_RenderTarget* right = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8,
+                                                  GPU_RB_DEPTH24_STENCIL8);
+
+C3D_RenderTargetSetOutput(left, GFX_TOP, GFX_LEFT, TRANSFER_FLAGS);
+C3D_RenderTargetSetOutput(right, GFX_TOP, GFX_RIGHT, TRANSFER_FLAGS);
+
+PER-FRAME RENDERING (Repeat Each Frame)
+========================================
+1. Get slider:
+   float slider = osGet3DSliderState();  // 0.0 to 1.0
+   float iod = slider / 3.0f;            // Convert to eye separation
+
+2. Start frame:
+   C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+
+3. Render LEFT eye:
+   C3D_RenderTargetClear(left, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
+   C3D_FrameDrawOn(left);
+   Mtx_PerspStereoTilt(&proj, C3D_AngleFromDegrees(40.0f),
+                       C3D_AspectRatioTop, 0.01f, 1000.0f,
+                       -iod,              // NEGATIVE for left eye!
+                       2.0f, false);
+   [Draw geometry]
+
+4. Render RIGHT eye (if iod > 0):
+   if (iod > 0.0f) {
+       C3D_RenderTargetClear(right, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
+       C3D_FrameDrawOn(right);
+       Mtx_PerspStereoTilt(&proj, C3D_AngleFromDegrees(40.0f),
+                           C3D_AspectRatioTop, 0.01f, 1000.0f,
+                           iod,               // POSITIVE for right eye!
+                           2.0f, false);
+       [Draw geometry]
+   }
+
+5. End frame:
+   C3D_FrameEnd(0);
+
+CITRO2D ALTERNATIVE (Simpler, 2D Only)
+=======================================
+// Setup (once):
+C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+C2D_Prepare();
+gfxSet3D(true);
+left = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+right = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
+
+// Per-frame:
+slider = osGet3DSliderState();
+C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+
+C2D_TargetClear(left, C2D_Color32(255,255,255,255));
+C2D_SceneBegin(left);
+C2D_DrawImageAt(img, 100 + offset*slider, 50, 0);  // RIGHT offset for left eye
+
+C2D_TargetClear(right, C2D_Color32(255,255,255,255));
+C2D_SceneBegin(right);
+C2D_DrawImageAt(img, 100 - offset*slider, 50, 0);  // LEFT offset for right eye
+
+C3D_FrameEnd(0);
+
+CRITICAL PARAMETERS
+====================
+IOD (Interocular Distance):
+  - Conservative: slider / 4.0f (less eye strain)
+  - Standard:     slider / 3.0f (RECOMMENDED)
+  - Aggressive:   slider / 2.0f (more dramatic)
+
+Screen Focal Distance (Convergence):
+  - 1.0f = wide (objects pop out easily)
+  - 2.0f = balanced (DEFAULT)
+  - 3.0f = narrow (objects stay inside)
+
+FOV:
+  - 30-40 degrees typical
+  - C3D_AngleFromDegrees(angle) for conversion
+
+Frame Rate:
+  - 30 FPS recommended for stereo
+  - 60 FPS possible but demanding
+
+MUST REMEMBER
+=============
+1. ALWAYS use Mtx_PerspStereoTilt (not just Mtx_PerspStereo)
+2. ALWAYS call gfxSet3D(true) BEFORE creating render targets
+3. ALWAYS pass -iod for left eye, +iod for right eye
+4. ALWAYS poll osGet3DSliderState() each frame
+5. ALWAYS skip right-eye rendering when iod == 0
+6. ALWAYS clear depth buffer between eyes
+
+TROUBLESHOOTING
+===============
+No 3D visible?          -> Call gfxSet3D(true)
+Blurry/misaligned?      -> Use Tilt version of matrix function
+No slider effect?       -> Poll osGet3DSliderState() each frame
+Right eye wrong?        -> Check iod sign (-iod vs +iod)
+Frame rate dropping?    -> Target 30 FPS instead of 60
+Eye strain?             -> Reduce IOD scale (use /4 instead of /3)
+
+DEPTH BUFFER FORMATS
+====================
+GPU_RB_DEPTH16          - Lighter, faster
+GPU_RB_DEPTH24          - Standard
+GPU_RB_DEPTH24_STENCIL8 - Best quality (recommended)
+
+COLOR BUFFER FORMATS
+====================
+GPU_RB_RGBA8    - Full color (recommended for stereo)
+GPU_RB_RGB565   - 16-bit (faster, uses less memory)
+GPU_RB_RGBA4    - Low quality
+
+HARDWARE FACTS
+==============
+Top Screen:     240 x 400 (portrait)
+Per-Eye:        240 x 400
+Bottom Screen:  240 x 320 (NO STEREO!)
+Aspect Ratio:   400/240 = 1.667
+Stereo Method:  Parallax barrier
+Memory/frame:   768 KB (RGBA8) or 384 KB (RGB565)
+Recommended:    30 FPS
+Maximum:        60 FPS
+
+EXAMPLE IMPLEMENTATIONS
+=======================
+Simplest:    stereoscopic_2d (2D sprites, <100 lines)
+Complete:    lenny (3D with lighting, ~150 lines)
+Reference:   particles, normal_mapping, fragment_light
+
+OPTIMIZATION TIPS
+=================
+1. Skip right-eye render when slider = 0
+2. Use GPU_RB_DEPTH24 instead of DEPTH24_STENCIL8 if needed
+3. Target 30 FPS to halve GPU load
+4. Use RGB565 for faster rendering
+5. Monitor C3D_GetDrawingTime() and C3D_GetProcessingTime()
+
+PERFORMANCE EXPECTATIONS
+========================
+GPU Load:       ~1.5-2.0x (rendering 2 scenes)
+CPU Load:       Minimal (mostly GPU-bound)
+Frame Time:     30 FPS = ~33ms per frame
+Memory:         ~1.5 MB per frame (RGBA8 + depth)
+Typical:        30-60 FPS achievable on real hardware
+
+API FUNCTIONS (ESSENTIAL)
+=========================
+gfxSet3D(bool)                    - Enable/disable 3D mode
+osGet3DSliderState()              - Get slider (0.0-1.0)
+C3D_RenderTargetCreate()          - Create target for eye
+C3D_RenderTargetSetOutput()       - Bind to LEFT/RIGHT output
+C3D_RenderTargetClear()           - Clear target
+C3D_FrameBegin()                  - Start frame
+C3D_FrameDrawOn()                 - Switch to target
+C3D_FrameEnd()                    - End frame
+Mtx_PerspStereoTilt()             - Stereo projection matrix
+C3D_DrawArrays()                  - Draw geometry
+C3D_GetDrawingTime()              - Performance monitoring
+C3D_FrameRate()                   - Set target FPS
+
+2D SPECIFIC
+===========
+C2D_CreateScreenTarget()          - Create 2D stereo target
+C2D_TargetClear()                 - Clear 2D target
+C2D_SceneBegin()                  - Start drawing to target
+C2D_DrawImageAt()                 - Draw sprite at position
+
+TESTING CHECKLIST
+=================
+[ ] 3D mode enabled (gfxSet3D)
+[ ] Render targets created (left + right)
+[ ] Targets bound to outputs (GFX_LEFT/RIGHT)
+[ ] Slider read each frame
+[ ] Projection matrices use Tilt variant
+[ ] IOD signs correct (-iod left, +iod right)
+[ ] Frame rate at 30 FPS or stable
+[ ] No eye strain with slider at max
+[ ] Performance acceptable (no drops below 25 FPS)
+
+EXAMPLES TO STUDY
+=================
+1. START: stereoscopic_2d - Simplest, just shifted sprites
+2. LEARN: lenny - Full 3D with proper depth
+3. STUDY: particles - Particle system with stereo
+4. ADVANCED: normal_mapping - Complex geometry
+5. POLISH: composite_scene - Multiple objects
+
+COMMON MISTAKES (AVOID!)
+========================
+[ ] Forget gfxSet3D(true)
+[ ] Use Mtx_PerspStereo instead of Tilt version
+[ ] Don't poll slider (static effect)
+[ ] Create targets before gfxSet3D
+[ ] Use GFX_LEFT for both eyes
+[ ] IOD too large (eye strain)
+[ ] Not clear depth buffer
+[ ] Target 60 FPS for stereo
+[ ] Mix up iod signs
+
+================================================================================
+Generated: October 21, 2025 | Status: Complete and Ready to Use
+================================================================================
