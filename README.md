@@ -243,4 +243,4 @@ If you find this project interesting, please consider:
 
 **Status:** Research Phase Complete | Prototype Development Starting Soon
 
-**Made with ❤️ for the 3DS Homebrew Community**
+**Made with ❤️ for the 3DS Homebrew Community with the exception of Nintendo Homebrew Discord**
