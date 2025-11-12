@@ -273,4 +273,4 @@ If you find this project interesting, please consider:
 
 **Binary:** `~/Desktop/matbo87-snes9x_3ds.3dsx` (2.2 MB)
 
-**Made with ❤️ for the 3DS Homebrew Community**
+**Made with ❤️ for the 3DS Homebrew Community with the exception of Nintendo Homebrew Discord**
