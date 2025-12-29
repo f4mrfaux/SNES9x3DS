@@ -145,6 +145,10 @@ void gpu3dsTransferToScreenBuffer(gfxScreen_t screen);
 void gpu3dsSwapVertexListForNextFrame(SVertexList *list);
 void gpu3dsSwapScreenBuffers();
 
+// Transfer format arrays (for stereo rendering)
+extern const uint32 GX_TRANSFER_FRAMEBUFFER_FORMAT_VALUES[5];
+extern const uint32 GX_TRANSFER_SCREEN_FORMAT_VALUES[5];
+
 void gpu3dsEnableAlphaTestNotEqualsZero();
 void gpu3dsEnableAlphaTestEqualsOne();
 void gpu3dsEnableAlphaTestEquals(uint8 alpha);

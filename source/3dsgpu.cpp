@@ -440,7 +440,8 @@ bool gpu3dsInitialize()
     //
     GPU3DS.screenFormat = GSP_RGBA8_OES;
     gfxInit(GPU3DS.screenFormat, GPU3DS.screenFormat, false);
-	gfxSet3D(false);
+	// Enable stereoscopic 3D if not disabled in settings
+	gfxSet3D(!settings3DS.Disable3DSlider);
     APT_CheckNew3DS(&GPU3DS.isNew3DS);
 
     // Create the frame and depth buffers for the main screen.
@@ -653,6 +654,11 @@ SGPUTexture *gpu3dsCreateTextureInVRAM(int width, int height, GPU_TEXCOLOR pixel
         return NULL;
 
 	void *data = vramMemAlign(size, 0x80);
+    if (data == NULL)
+    {
+        printf ("Unable to allocate %dx%d VRAM texture (fmt=%d)\n", width, height, pixelFormat);
+        return NULL;
+    }
 
 	SGPUTexture *texture = (SGPUTexture *) malloc(sizeof(SGPUTexture));
 

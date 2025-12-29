@@ -36,6 +36,19 @@ bool S9xSettings3DS::operator==(const S9xSettings3DS& other) const {
           (GlobalVolume == other.GlobalVolume) &&
           (GlobalBindCirclePad == other.GlobalBindCirclePad) &&
           (RomFsLoaded == other.RomFsLoaded) &&
+          (EnableStereo3D == other.EnableStereo3D) &&
+          (AutoLoadStereoProfiles == other.AutoLoadStereoProfiles) &&
+          (StereoDepthStrength == other.StereoDepthStrength) &&
+          (LayerDepth[0] == other.LayerDepth[0]) &&
+          (LayerDepth[1] == other.LayerDepth[1]) &&
+          (LayerDepth[2] == other.LayerDepth[2]) &&
+          (LayerDepth[3] == other.LayerDepth[3]) &&
+          (LayerDepth[4] == other.LayerDepth[4]) &&
+          (ScreenPlaneLayer == other.ScreenPlaneLayer) &&
+          (EnablePerSpriteDepth == other.EnablePerSpriteDepth) &&
+          (Mode7DepthNear == other.Mode7DepthNear) &&
+          (Mode7DepthFar == other.Mode7DepthFar) &&
+          (Mode7UseGradient == other.Mode7UseGradient) &&
           (Disable3DSlider == other.Disable3DSlider) &&
           (GameThumbnailType == other.GameThumbnailType) &&
           (Theme == other.Theme) &&

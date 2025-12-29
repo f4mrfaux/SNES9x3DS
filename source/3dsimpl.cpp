@@ -9,6 +9,9 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <3ds.h>
+#include <fstream>
+#include <sstream>
+#include <ctime>
 #include <stb_image.h>
 
 #include <dirent.h>
@@ -28,9 +31,11 @@
 #include "3dsmenu.h"
 #include "3dsui.h"
 #include "3dsinput.h"
+#include "3dsstereo.h"
 #include "3dsimpl.h"
 #include "3dsimpl_tilecache.h"
 #include "3dsimpl_gpu.h"
+#include "3dslog.h"
 
 // Compiled shaders
 //
@@ -86,6 +91,16 @@ SGPUTexture *snesMode7Tile0Texture;
 SGPUTexture *snesDepthForScreens;
 SGPUTexture *snesDepthForOtherTextures;
 
+// Helper to destroy a texture with the correct allocator backing
+static inline void destroyTexture(SGPUTexture *tex) {
+    if (!tex) return;
+    if (tex->Memory == 0) {
+        gpu3dsDestroyTextureFromLinearMemory(tex);
+    } else {
+        gpu3dsDestroyTextureFromVRAM(tex);
+    }
+}
+
 static u32 screen_next_pow_2(u32 i) {
     i--;
     i |= i >> 1;
@@ -109,9 +124,16 @@ float currentBorderAlpha = -1;
 //---------------------------------------------------------
 bool impl3dsInitializeCore()
 {
+	// Initialize logging system (writes to SD card: sdmc:/snes9x_3ds_stereo.log)
+	//
+	log3dsInit(true);
+	LOG_INFO("INIT", "SNES9x 3DS Stereo - Starting initialization");
+	LOG_INFO("INIT", "Version: %d.%d.%d", VERSION_MAJOR, VERSION_MINOR, VERSION_MICRO);
+
 	// Initialize our CSND engine.
 	//
 	snd3dsSetSampleRate(32000, 256);
+	LOG_INFO("INIT", "Sound initialized: 32000 Hz, 256 samples");
 
 	// Initialize our tile cache engine.
 	//
@@ -135,7 +157,7 @@ bool impl3dsInitializeCore()
 
     // This requires 16x16 texture as a minimum
     snesMode7Tile0Texture = gpu3dsCreateTextureInVRAM(16, 16, GPU_RGBA4);    //
-    snesMode7FullTexture = gpu3dsCreateTextureInVRAM(1024, 1024, GPU_RGBA4); // 2.000 MB
+    snesMode7FullTexture = gpu3dsCreateTextureInVRAM(512, 512, GPU_RGBA4);   // 0.500 MB (reduced for VRAM headroom)
 
     // Main screen requires 8-bit alpha, otherwise alpha blending will not work well
     snesMainScreenTarget = gpu3dsCreateTextureInVRAM(256, 256, GPU_RGBA8);      // 0.250 MB
@@ -145,8 +167,13 @@ bool impl3dsInitializeCore()
     // Performance: Create depth buffers in VRAM improves GPU performance!
     //              Games like Axelay, F-Zero (EUR) now run close to full speed!
     //
-    snesDepthForScreens = gpu3dsCreateTextureInVRAM(256, 256, GPU_RGBA8);       // 0.250 MB
-    snesDepthForOtherTextures = gpu3dsCreateTextureInVRAM(512, 512, GPU_RGBA8); // 1.000 MB
+    bool useLinearDepth = GPU3DS.isReal3DS;  // Save VRAM on hardware; keep VRAM on Citra for perf parity
+    snesDepthForScreens = useLinearDepth
+        ? gpu3dsCreateTextureInLinearMemory(256, 256, GPU_RGBA8)
+        : gpu3dsCreateTextureInVRAM(256, 256, GPU_RGBA8);       // 0.250 MB
+    snesDepthForOtherTextures = useLinearDepth
+        ? gpu3dsCreateTextureInLinearMemory(512, 512, GPU_RGBA8)
+        : gpu3dsCreateTextureInVRAM(512, 512, GPU_RGBA8);       // 1.000 MB
 
     if (snesTileCacheTexture == NULL || snesMode7FullTexture == NULL ||
         snesMode7TileCacheTexture == NULL || snesMode7Tile0Texture == NULL ||
@@ -164,6 +191,15 @@ bool impl3dsInitializeCore()
         gpu3dsAllocVertexList(&GPU3DSExt.quadVertexes, REAL3DS_VERTEX_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
         gpu3dsAllocVertexList(&GPU3DSExt.tileVertexes, REAL3DS_TILE_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
         gpu3dsAllocVertexList(&GPU3DSExt.mode7LineVertexes, REAL3DS_MODE7_LINE_BUFFER_SIZE, sizeof(SMode7LineVertex), 2, SMODE7LINEVERTEX_ATTRIBFORMAT);
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoMode7LineVertexes[0], REAL3DS_MODE7_LINE_BUFFER_SIZE, sizeof(SMode7LineVertex), 2, SMODE7LINEVERTEX_ATTRIBFORMAT);
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoMode7LineVertexes[1], REAL3DS_MODE7_LINE_BUFFER_SIZE, sizeof(SMode7LineVertex), 2, SMODE7LINEVERTEX_ATTRIBFORMAT);
+
+        // Plan E: Allocate per-eye stereo vertex buffers for tiles and quads
+        // Note: UI rectangles use mono buffer (zero parallax at screen plane for comfort)
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoQuadVertexes[0], REAL3DS_VERTEX_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoQuadVertexes[1], REAL3DS_VERTEX_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoTileVertexes[0], REAL3DS_TILE_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoTileVertexes[1], REAL3DS_TILE_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
     }
     else
     {
@@ -172,6 +208,15 @@ bool impl3dsInitializeCore()
         gpu3dsAllocVertexList(&GPU3DSExt.quadVertexes, CITRA_VERTEX_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
         gpu3dsAllocVertexList(&GPU3DSExt.tileVertexes, CITRA_TILE_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
         gpu3dsAllocVertexList(&GPU3DSExt.mode7LineVertexes, CITRA_MODE7_LINE_BUFFER_SIZE, sizeof(SMode7LineVertex), 2, SMODE7LINEVERTEX_ATTRIBFORMAT);
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoMode7LineVertexes[0], CITRA_MODE7_LINE_BUFFER_SIZE, sizeof(SMode7LineVertex), 2, SMODE7LINEVERTEX_ATTRIBFORMAT);
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoMode7LineVertexes[1], CITRA_MODE7_LINE_BUFFER_SIZE, sizeof(SMode7LineVertex), 2, SMODE7LINEVERTEX_ATTRIBFORMAT);
+
+        // Plan E: Allocate per-eye stereo vertex buffers (Citra)
+        // Note: UI rectangles use mono buffer (zero parallax at screen plane for comfort)
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoQuadVertexes[0], CITRA_VERTEX_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoQuadVertexes[1], CITRA_VERTEX_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoTileVertexes[0], CITRA_TILE_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
+        gpu3dsAllocVertexList(&GPU3DSExt.stereoTileVertexes[1], CITRA_TILE_BUFFER_SIZE, sizeof(STileVertex), 2, STILEVERTEX_ATTRIBFORMAT);
     }
 
     if (GPU3DSExt.quadVertexes.ListBase == NULL ||
@@ -270,6 +315,16 @@ bool impl3dsInitializeCore()
     so.buffer_size = 32768;
     so.encoded = FALSE;
 
+    // Initialize stereoscopic system (lazy allocation - targets created when slider > 0)
+    // This saves ~1MB VRAM when 3D slider is off
+    if (!stereo3dsInitialize()) {
+        LOG_ERROR("INIT", "Stereo initialization failed");
+        settings3DS.EnableStereo3D = false;
+    } else {
+        LOG_INFO("INIT", "Stereo 3D initialized (lazy allocation mode)");
+        settings3DS.EnableStereo3D = true;
+        stereo3dsSetEnabled(true);  // Enable stereo rendering
+    }
 
     return true;
 }
@@ -279,28 +334,40 @@ bool impl3dsInitializeCore()
 //---------------------------------------------------------
 void impl3dsFinalize()
 {
-	// Frees up all vertex lists
-	//
+    stereo3dsFinalize();
+
+    // Frees up all vertex lists
+    //
     gpu3dsDeallocVertexList(&GPU3DSExt.mode7TileVertexes);
     gpu3dsDeallocVertexList(&GPU3DSExt.rectangleVertexes);
     gpu3dsDeallocVertexList(&GPU3DSExt.quadVertexes);
     gpu3dsDeallocVertexList(&GPU3DSExt.tileVertexes);
     gpu3dsDeallocVertexList(&GPU3DSExt.mode7LineVertexes);
+    gpu3dsDeallocVertexList(&GPU3DSExt.stereoMode7LineVertexes[0]);
+    gpu3dsDeallocVertexList(&GPU3DSExt.stereoMode7LineVertexes[1]);
+    gpu3dsDeallocVertexList(&GPU3DSExt.stereoMode7LineVertexes[0]);
+    gpu3dsDeallocVertexList(&GPU3DSExt.stereoMode7LineVertexes[1]);
+
+    // Plan E: Free stereo vertex lists
+    gpu3dsDeallocVertexList(&GPU3DSExt.stereoQuadVertexes[0]);
+    gpu3dsDeallocVertexList(&GPU3DSExt.stereoQuadVertexes[1]);
+    gpu3dsDeallocVertexList(&GPU3DSExt.stereoTileVertexes[0]);
+    gpu3dsDeallocVertexList(&GPU3DSExt.stereoTileVertexes[1]);
 	
 	// Frees up all textures.
 	//
-    gpu3dsDestroyTextureFromLinearMemory(snesTileCacheTexture);
-    gpu3dsDestroyTextureFromLinearMemory(snesMode7TileCacheTexture);
+    destroyTexture(snesTileCacheTexture);
+    destroyTexture(snesMode7TileCacheTexture);
 
-    gpu3dsDestroyTextureFromVRAM(snesMode7Tile0Texture);
-    gpu3dsDestroyTextureFromVRAM(snesMode7FullTexture);
-    gpu3dsDestroyTextureFromVRAM(snesMainScreenTarget);
-    gpu3dsDestroyTextureFromVRAM(snesSubScreenTarget);
+    destroyTexture(snesMode7Tile0Texture);
+    destroyTexture(snesMode7FullTexture);
+    destroyTexture(snesMainScreenTarget);
+    destroyTexture(snesSubScreenTarget);
 
-    gpu3dsDestroyTextureFromVRAM(snesDepthForOtherTextures);
-    gpu3dsDestroyTextureFromVRAM(snesDepthForScreens);
+    destroyTexture(snesDepthForOtherTextures);
+    destroyTexture(snesDepthForScreens);
 	if (borderTexture)
-    	gpu3dsDestroyTextureFromVRAM(borderTexture);
+    	destroyTexture(borderTexture);
 
 #ifndef RELEASE
     printf("S9xGraphicsDeinit:\n");
@@ -398,7 +465,7 @@ int x = 0;
 void impl3dsSetBorderImage() {
 	if (settings3DS.GameBorder == 0) {
 		if (borderTexture) {
-			gpu3dsDestroyTextureFromVRAM(borderTexture);
+			destroyTexture(borderTexture);
 			borderTexture = NULL;
 		}
 
@@ -433,7 +500,7 @@ void impl3dsSetBorderImage() {
 
 	if (border.Buffer.empty()) {
 		if (borderTexture) {
-			gpu3dsDestroyTextureFromVRAM(borderTexture);
+			destroyTexture(borderTexture);
 			borderTexture = NULL;
 		}
 
@@ -492,7 +559,15 @@ void impl3dsPrepareForNewFrame()
     gpu3dsSwapVertexListForNextFrame(&GPU3DSExt.quadVertexes);
     gpu3dsSwapVertexListForNextFrame(&GPU3DSExt.tileVertexes);
     gpu3dsSwapVertexListForNextFrame(&GPU3DSExt.rectangleVertexes);
-    gpu3dsSwapVertexListForNextFrame(&GPU3DSExt.mode7LineVertexes);	
+    gpu3dsSwapVertexListForNextFrame(&GPU3DSExt.mode7LineVertexes);
+
+    // Plan E: Reset stereo vertex lists too
+    for (int eye = 0; eye < 2; ++eye)
+    {
+        gpu3dsSwapVertexListForNextFrame(&GPU3DSExt.stereoQuadVertexes[eye]);
+        gpu3dsSwapVertexListForNextFrame(&GPU3DSExt.stereoTileVertexes[eye]);
+        gpu3dsSwapVertexListForNextFrame(&GPU3DSExt.stereoMode7LineVertexes[eye]);
+    }
 }
 
 
@@ -504,26 +579,100 @@ void impl3dsRunOneFrame(bool firstFrame, bool skipDrawingFrame)
 	Memory.ApplySpeedHackPatches();
 	gpu3dsEnableAlphaBlending();
 
+	// ========================================================================
+	// Stereoscopic 3D: Poll 3D slider state
+	// ========================================================================
+	// Read hardware slider (0.0-1.0 from physical slider)
+	float hwSlider = settings3DS.Disable3DSlider ? 0.0f : osGet3DSliderState();
+
+	// DO NOT overwrite user's max depth setting!
+	// settings3DS.StereoSliderValue = USER'S MAX DEPTH (persisted in config)
+
+	// Calculate effective depth: hardware × user max × depth strength × comfort
+	const float COMFORT_SCALE = 1.0f;              // adjust if effect feels too strong
+	float userMax = settings3DS.StereoSliderValue; // User's configured max depth (from menu/profile)
+	float effective = hwSlider * userMax * settings3DS.StereoDepthStrength * COMFORT_SCALE;
+
+	// Stereo is active if enabled AND effective depth > threshold
+	bool stereoActive = settings3DS.EnableStereo3D && effective >= 0.01f;
+	stereo3dsSetEnabled(stereoActive);
+
+	// DEBUG: Log stereo mode changes (first 20 times only)
+	static bool lastStereoActive = false;
+	static int stereoChangeCount = 0;
+	if (stereoActive != lastStereoActive && stereoChangeCount < 20) {
+		LOG_INFO("STEREO-DBG", ">>> STEREO MODE CHANGE: %s -> %s (hwSlider=%.2f effective=%.2f)",
+		         lastStereoActive ? "ACTIVE" : "INACTIVE",
+		         stereoActive ? "ACTIVE" : "INACTIVE",
+		         hwSlider, effective);
+		LOG_INFO("STEREO-DBG", "    EnableStereo3D=%d Disable3DSlider=%d stereo3dsIsEnabled=%d gfxSet3D called",
+		         settings3DS.EnableStereo3D, settings3DS.Disable3DSlider, stereo3dsIsEnabled());
+		lastStereoActive = stereoActive;
+		stereoChangeCount++;
+	}
+
+	// Update logging (tracks slider changes, frame counts, etc.)
+	stereo3dsLogFrameUpdate(effective, stereoActive);
+
 	if (GPU3DS.emulatorState != EMUSTATE_EMULATE)
 		return;
 
+	// ========================================================================
+	// Stereoscopic 3D: Plan E Per-Eye Rendering
+	// ========================================================================
+	// Plan E renders each layer with per-eye horizontal offsets, filling both
+	// stereoTileVertexes[0] and [1] simultaneously during S9xMainLoop().
+	// Then gpu3dsDrawVertexes() renders both eyes to separate render targets,
+	// and stereo3dsTransferToScreenBuffers() copies to GFX_LEFT/GFX_RIGHT.
+	// ========================================================================
+
 	IPPU.RenderThisFrame = !skipDrawingFrame;
 
+	// Plan E: Set layer offsets for BOTH eyes before rendering
+	stereo3dsUpdateLayerOffsetsFromSlider(effective);
+
+	// Plan E: Ensure stereo targets are created if stereo is active (lazy allocation)
+	// This must happen BEFORE S9xMainLoop() so render targets exist during rendering
+	bool stereoTargetsReady = false;
+	if (stereoActive && stereo3dsIsEnabled()) {
+		stereoTargetsReady = stereo3dsEnsureTargetsCreated();
+		if (!stereoTargetsReady) {
+			LOG_ERROR("STEREO", "Failed to create stereo targets - falling back to mono");
+			stereo3dsSetEnabled(false);  // Disable stereo if targets can't be created
+			stereoActive = false;  // Update local flag
+		}
+	}
+
+	// Set initial render target
+	// CRITICAL: Always set to main screen first - this ensures we have a fallback if stereo fails
+	// For mono mode: this is the final target
+	// For stereo mode: gpu3dsDrawVertexes() will switch to stereo targets, but main screen remains as fallback
 	gpu3dsSetRenderTargetToMainScreenTexture();
+    // Clear depth (and color) on the main target each frame to avoid stale depth
+    gpu3dsClearColorAndDepth(256, 240);
+    // Clear the sub screen target as well to avoid stale depth when used
+    gpu3dsSetRenderTargetToSubScreenTexture();
+    gpu3dsClearColorAndDepth(256, 240);
+    // Restore to main for the rest of the frame setup
+    gpu3dsSetRenderTargetToMainScreenTexture();
 	gpu3dsUseShader(1);             // for drawing tiles
 
 #ifdef RELEASE
+	t3dsStartTiming(10, "S9xMainLoop");
 	if (!Settings.SA1)
 		S9xMainLoop();
 	else
 		S9xMainLoopWithSA1();
+	t3dsEndTiming(10);
 #else
 	if (!Settings.Paused)
 	{
+		t3dsStartTiming(10, "S9xMainLoop");
 		if (!Settings.SA1)
 			S9xMainLoop();
 		else
 			S9xMainLoopWithSA1();
+		t3dsEndTiming(10);
 	}
 #endif
 
@@ -548,46 +697,52 @@ void impl3dsRunOneFrame(bool firstFrame, bool skipDrawingFrame)
 	gpu3dsDisableDepthTest();
 	gpu3dsDisableAlphaTest();
 	
-	if(settings3DS.GameBorder > 0 && borderTexture)
+	// CRITICAL FIX: In stereo mode, skip the compositing draw calls
+	// The SNES geometry is already rendered to stereo targets during S9xMainLoop()
+	// These draw calls would reset the vertex counts, leaving stereo targets empty
+	if (!stereoActive)
 	{
-		// Copy the border texture  to the 3DS frame
-		gpu3dsBindTexture(borderTexture, GPU_TEXUNIT0);
+		if(settings3DS.GameBorder > 0 && borderTexture)
+		{
+			// Copy the border texture  to the 3DS frame
+			gpu3dsBindTexture(borderTexture, GPU_TEXUNIT0);
+			gpu3dsSetTextureEnvironmentReplaceTexture0();
+			gpu3dsDisableStencilTest();
+
+			int bx0 = (screenSettings.GameScreenWidth - SCREEN_TOP_WIDTH) / 2;
+			int bx1 = bx0 + SCREEN_TOP_WIDTH;
+			gpu3dsAddQuadVertexes(bx0, 0, bx1, SCREEN_HEIGHT, 0, 0, SCREEN_TOP_WIDTH, SCREEN_HEIGHT, 0.1f);
+
+			gpu3dsDrawVertexes();
+		}
+
+		gpu3dsBindTextureMainScreen(GPU_TEXUNIT0);
 		gpu3dsSetTextureEnvironmentReplaceTexture0();
 		gpu3dsDisableStencilTest();
-		
-		int bx0 = (screenSettings.GameScreenWidth - SCREEN_TOP_WIDTH) / 2;
-		int bx1 = bx0 + SCREEN_TOP_WIDTH;
-		gpu3dsAddQuadVertexes(bx0, 0, bx1, SCREEN_HEIGHT, 0, 0, SCREEN_TOP_WIDTH, SCREEN_HEIGHT, 0.1f);
-	
+
+		// PPU.ScreenHeight - 1 seems necessary for pixel perfect image. 224px height causes blurryness otherwise
+		int sHeight = (settings3DS.StretchHeight == -1 ? PPU.ScreenHeight - 1 : settings3DS.StretchHeight);
+		int sWidth = settings3DS.StretchWidth;
+
+		// Make sure "8:7 Fit" won't increase sWidth when current PPU.ScreenHeight = SNES_HEIGHT_EXTENDED
+		if (sWidth == 01010000)
+		{
+			sWidth = PPU.ScreenHeight < SNES_HEIGHT_EXTENDED ? SNES_HEIGHT_EXTENDED * SNES_WIDTH / SNES_HEIGHT : SNES_WIDTH;
+			sHeight = SNES_HEIGHT_EXTENDED;
+		}
+
+		int sx0 = (screenSettings.GameScreenWidth - sWidth) / 2;
+		int sx1 = sx0 + sWidth;
+		int sy0 = (SCREEN_HEIGHT - sHeight) / 2;
+		int sy1 = sy0 + sHeight;
+
+		gpu3dsAddQuadVertexes(
+			sx0, sy0, sx1, sy1,
+			settings3DS.CropPixels, settings3DS.CropPixels ? settings3DS.CropPixels : 1,
+			256 - settings3DS.CropPixels, PPU.ScreenHeight - settings3DS.CropPixels,
+			0.1f);
 		gpu3dsDrawVertexes();
 	}
-	
-	gpu3dsBindTextureMainScreen(GPU_TEXUNIT0);
-	gpu3dsSetTextureEnvironmentReplaceTexture0();
-	gpu3dsDisableStencilTest();
-
-	// PPU.ScreenHeight - 1 seems necessary for pixel perfect image. 224px height causes blurryness otherwise
-    int sHeight = (settings3DS.StretchHeight == -1 ? PPU.ScreenHeight - 1 : settings3DS.StretchHeight);
-    int sWidth = settings3DS.StretchWidth;
-
-	// Make sure "8:7 Fit" won't increase sWidth when current PPU.ScreenHeight = SNES_HEIGHT_EXTENDED
-	if (sWidth == 01010000)
-	{
-		sWidth = PPU.ScreenHeight < SNES_HEIGHT_EXTENDED ? SNES_HEIGHT_EXTENDED * SNES_WIDTH / SNES_HEIGHT : SNES_WIDTH;
-		sHeight = SNES_HEIGHT_EXTENDED;
-	}
-
-	int sx0 = (screenSettings.GameScreenWidth - sWidth) / 2;
-	int sx1 = sx0 + sWidth;
-	int sy0 = (SCREEN_HEIGHT - sHeight) / 2;
-	int sy1 = sy0 + sHeight;
-
-	gpu3dsAddQuadVertexes(
-		sx0, sy0, sx1, sy1,
-		settings3DS.CropPixels, settings3DS.CropPixels ? settings3DS.CropPixels : 1, 
-		256 - settings3DS.CropPixels, PPU.ScreenHeight - settings3DS.CropPixels, 
-		0.1f);
-	gpu3dsDrawVertexes();
 
 	t3dsEndTiming(3);
 
@@ -599,7 +754,38 @@ void impl3dsRunOneFrame(bool firstFrame, bool skipDrawingFrame)
 		// to complete
 		//
 		t3dsStartTiming(5, "Transfer");
-		gpu3dsTransferToScreenBuffer(screenSettings.GameScreen);
+
+		// Stereoscopic 3D (Plan E): Use per-eye transfer if enabled and slider > 0
+		static int pathLogCounter = 0;
+		pathLogCounter++;
+		bool stereoTransferActive = stereoActive && stereo3dsIsEnabled();
+
+		// Plan E uses per-eye vertex buffers filled during S9xMainLoop(), then transfers
+		// both eyes' render targets to GFX_LEFT/GFX_RIGHT framebuffers.
+		if (stereoTransferActive) {
+			if (pathLogCounter == 1) {
+				LOG_INFO("STEREO", "First frame: STEREO mode active (effective slider=%.2f)", effective);
+			}
+		} else {
+			if (pathLogCounter == 1) {
+				LOG_INFO("STEREO", "First frame: MONO mode");
+			}
+		}
+
+		// Plan E: Use stereo transfer if enabled, otherwise mono
+		if (stereoTransferActive) {
+			bool stereoOk = stereo3dsTransferToScreenBuffers();
+			if (!stereoOk) {
+				// Fallback to mono if stereo targets unavailable (VRAM pressure)
+				// CRITICAL: Main screen should have been rendered to as fallback in gpu3dsDrawVertexes()
+				// If stereo failed, we should have mono content in snesMainScreenTarget
+				LOG_WARN("STEREO", "Stereo transfer failed - using mono fallback");
+				gpu3dsTransferToScreenBuffer(screenSettings.GameScreen);
+			}
+		} else {
+			// Mono mode: Transfer from main screen target (always rendered to)
+			gpu3dsTransferToScreenBuffer(screenSettings.GameScreen);
+		}
 		gpu3dsSwapScreenBuffers();
 		t3dsEndTiming(5);
 

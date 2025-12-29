@@ -198,6 +198,40 @@ typedef struct S9xSettings3DS
 
     bool    RomFsLoaded = false;            // Stores whether we successfully opened the RomFS.
 
+    // ========================================================================
+    // Stereoscopic 3D Settings (M2-style Layer Separation)
+    // ========================================================================
+
+    bool    EnableStereo3D = true;          // Master stereo toggle
+    bool    AutoLoadStereoProfiles = true;  // Load per-game depth profiles
+    float   StereoDepthStrength = 0.7f;     // Global depth multiplier (safer default)
+    float   StereoSliderValue = 0.8f;       // User's max depth intensity (0.0-2.0) - NOT hardware slider!
+                                            // Hardware slider acts as real-time multiplier of this value
+
+    // Per-layer depth configuration
+    // Higher values = farther into screen, Lower/negative = pop out
+    // BG layers: 0-3 correspond to SNES PPU backgrounds
+    // Layer 4 is for sprites
+    //
+    // IPD Safety: Values chosen to stay within 3DS IPD comfort limit (~34px total parallax)
+    // Formula: total_parallax = depth_value × 2 (left+right eyes)
+    // Max safe: 17px per eye = 34px total parallax
+    float   LayerDepth[5] = {8.0f, 5.0f, 2.5f, 0.0f, -8.0f};
+                                            // Default depths (IPD-safe):
+                                            // [0]=BG0: 12.0px (far background, 24px total)
+                                            // [1]=BG1: 8.0px (mid-depth, 16px total)
+                                            // [2]=BG2: 4.0px (near background, 8px total)
+                                            // [3]=BG3: 0.0px (at screen plane, 0px total)
+                                            // [4]=Sprites: -15.0px (pop out, 30px total - safe limit)
+
+    int     ScreenPlaneLayer = 3;           // Which layer at screen plane (0-4, -1=auto)
+    bool    EnablePerSpriteDepth = false;   // Advanced: Separate sprite depths
+
+    // Mode 7 specific settings
+    float   Mode7DepthNear = 1.0f;          // Depth for near scanlines (bottom)
+    float   Mode7DepthFar = 8.0f;           // Depth for far scanlines (top/horizon)
+    bool    Mode7UseGradient = false;       // Enable per-scanline depth gradient
+
     int     Disable3DSlider = 0;              // Disable 3DSlider
 
     bool operator==(const S9xSettings3DS& other) const;

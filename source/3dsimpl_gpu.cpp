@@ -6,8 +6,40 @@
 #include "3dsgpu.h"
 #include "3dsimpl.h"
 #include "3dsimpl_gpu.h"
+#include "3dsopt.h"  // For t3dsStartTiming/t3dsEndTiming
+#include "3dslog.h"  // For LOG_INFO macro
+#include <fstream>
+#include <sstream>
+#include <ctime>
 
 SGPU3DSExtended GPU3DSExt;
+
+// Stereo clear flag - tracks whether we've cleared stereo targets this frame
+static bool g_stereoClearedThisFrame = false;
+
+// Reset stereo clear flag at start of each frame (called after stereo transfer)
+void gpu3dsResetStereoClearFlag()
+{
+    g_stereoClearedThisFrame = false;
+}
+
+// Utility: clear color+depth on current render target (simple fullscreen quad)
+void gpu3dsClearColorAndDepth(int width, int height)
+{
+    gpu3dsDisableAlphaBlending();
+    gpu3dsSetTextureEnvironmentReplaceColor();
+    GPU_SetDepthTestAndWriteMask(true, GPU_ALWAYS, GPU_WRITE_ALL);
+    gpu3dsDrawRectangle(0, 0, width, height, 0, 0x000000ff);
+    GPU_SetDepthTestAndWriteMask(true, GPU_GEQUAL, GPU_WRITE_ALL);
+}
+
+// Stereoscopic 3D layer offset system (Plan E: Per-eye vertex buffers)
+// [eye][layer] - Eye 0 = LEFT, Eye 1 = RIGHT, Layers 0-3 = BG0-3, 4 = Sprites
+float g_stereoLayerOffsets[2][5] = {
+    {0.0f, 0.0f, 0.0f, 0.0f, 0.0f},  // LEFT eye offsets
+    {0.0f, 0.0f, 0.0f, 0.0f, 0.0f}   // RIGHT eye offsets
+};
+int g_currentLayerIndex = 0;  // Which layer we're currently rendering (0-4)
 
 void gpu3dsSetMode7UpdateFrameCountUniform();
 
@@ -178,9 +210,141 @@ void gpu3dsAddRectangleVertexes(int x0, int y0, int x1, int y1, int depth, u32 c
 
 void gpu3dsDrawVertexes(bool repeatLastDraw, int storeIndex)
 {
-    gpu3dsDrawVertexList(&GPU3DSExt.quadVertexes, GPU_TRIANGLES, repeatLastDraw, 0, storeIndex);
-    gpu3dsDrawVertexList(&GPU3DSExt.tileVertexes, GPU_GEOMETRY_PRIM, repeatLastDraw, 1, storeIndex);
-    gpu3dsDrawVertexList(&GPU3DSExt.rectangleVertexes, GPU_GEOMETRY_PRIM, repeatLastDraw, 2, storeIndex);
+    t3dsStartTiming(11, "DrawVertexes");
+
+    // Plan E: Check if stereo is enabled (slider check handled in offset calculation)
+    bool stereoEnabled = stereo3dsIsEnabled();
+
+    if (!stereoEnabled)
+    {
+        t3dsStartTiming(12, "DrawVtx-Mono");
+        // Mono path: Draw to single target (unchanged from original)
+        gpu3dsDrawVertexList(&GPU3DSExt.quadVertexes, GPU_TRIANGLES, repeatLastDraw, 0, storeIndex);
+        gpu3dsDrawVertexList(&GPU3DSExt.tileVertexes, GPU_GEOMETRY_PRIM, repeatLastDraw, 1, storeIndex);
+        gpu3dsDrawVertexList(&GPU3DSExt.rectangleVertexes, GPU_GEOMETRY_PRIM, repeatLastDraw, 2, storeIndex);
+        t3dsEndTiming(12);
+    }
+    else
+    {
+        t3dsStartTiming(13, "DrawVtx-Stereo");
+        // Plan E: Stereo path - draw BOTH eyes to separate render targets
+        // Safety: Check if targets exist before attempting to render
+        if (!stereo3dsAreTargetsCreated()) {
+            // Fallback: Targets don't exist, render to main screen (mono mode)
+            // This prevents black screen when stereo is enabled but targets failed to create
+            gpu3dsDrawVertexList(&GPU3DSExt.quadVertexes, GPU_TRIANGLES, repeatLastDraw, 0, storeIndex);
+            gpu3dsDrawVertexList(&GPU3DSExt.tileVertexes, GPU_GEOMETRY_PRIM, repeatLastDraw, 1, storeIndex);
+            gpu3dsDrawVertexList(&GPU3DSExt.rectangleVertexes, GPU_GEOMETRY_PRIM, repeatLastDraw, 2, storeIndex);
+            return;  // Early return - don't try to render to non-existent stereo targets
+        }
+
+        // If slider is effectively zero, render only left eye to save work (matches devkitPro pattern)
+        bool rightEyeActive = stereo3dsGetSliderValue() >= 0.01f;
+
+        // DEBUG: Log vertex counts before drawing (first 10 stereo frames only)
+        static int stereoDrawCount = 0;
+        if (stereoDrawCount < 10) {
+            LOG_INFO("STEREO-DBG", ">>> STEREO DRAW #%d: rightEyeActive=%d slider=%.2f",
+                     stereoDrawCount, rightEyeActive, stereo3dsGetSliderValue());
+            LOG_INFO("STEREO-DBG", "    LEFT:  tileVerts=%d quadVerts=%d rectVerts=%d",
+                     GPU3DSExt.stereoTileVertexes[0].Count,
+                     GPU3DSExt.stereoQuadVertexes[0].Count,
+                     GPU3DSExt.rectangleVertexes.Count);
+            LOG_INFO("STEREO-DBG", "    RIGHT: tileVerts=%d quadVerts=%d rectVerts=%d",
+                     GPU3DSExt.stereoTileVertexes[1].Count,
+                     GPU3DSExt.stereoQuadVertexes[1].Count,
+                     GPU3DSExt.rectangleVertexes.Count);
+            stereoDrawCount++;
+        }
+
+        // CRITICAL FIX: Only clear stereo targets ONCE per frame, not on every PPU layer draw
+        // PPU calls gpu3dsDrawVertexes() multiple times (BG0, BG1, sprites, etc)
+        // Clearing every time would erase previous layers!
+
+        // Clear BOTH stereo targets before rendering (only on first draw call of frame)
+        if (!g_stereoClearedThisFrame) {
+            static int clearLogCount = 0;
+            if (clearLogCount < 3) {
+                LOG_INFO("CLEAR-DBG", "=== CLEARING STEREO TARGETS (frame clear #%d) ===", clearLogCount);
+            }
+
+            // Clear LEFT eye target (256x256 to match mono screen target)
+            if (stereo3dsSetActiveRenderTarget(STEREO_EYE_LEFT)) {
+                gpu3dsDisableAlphaBlending();
+                gpu3dsSetTextureEnvironmentReplaceColor();
+                gpu3dsClearColorAndDepth(256, 256);
+                if (clearLogCount < 3) {
+                    LOG_INFO("CLEAR-DBG", "  LEFT eye cleared to BLACK (256x256)");
+                }
+            }
+            // Clear RIGHT eye target (256x256 to match mono screen target)
+            if (stereo3dsSetActiveRenderTarget(STEREO_EYE_RIGHT)) {
+                gpu3dsDisableAlphaBlending();
+                gpu3dsSetTextureEnvironmentReplaceColor();
+                gpu3dsClearColorAndDepth(256, 256);
+                if (clearLogCount < 3) {
+                    LOG_INFO("CLEAR-DBG", "  RIGHT eye cleared to BLACK (256x256)");
+                    clearLogCount++;
+                }
+            }
+            g_stereoClearedThisFrame = true;  // Mark as cleared for this frame
+        }
+
+        for (int eye = 0; eye < (rightEyeActive ? 2 : 1); ++eye)
+        {
+            // Switch to this eye's render target (returns false if targets don't exist)
+            bool targetSwitchOk = stereo3dsSetActiveRenderTarget(eye == 0 ? STEREO_EYE_LEFT : STEREO_EYE_RIGHT);
+            if (!targetSwitchOk) {
+                // Critical: Target switch failed - fallback to main screen
+                // This should never happen if stereo3dsAreTargetsCreated() returned true, but safety first
+                gpu3dsSetRenderTargetToMainScreenTexture();
+                // Use mono buffers as fallback (only render once)
+                if (eye == 0) {
+                    gpu3dsDrawVertexList(&GPU3DSExt.quadVertexes, GPU_TRIANGLES, repeatLastDraw, 0, storeIndex);
+                    gpu3dsDrawVertexList(&GPU3DSExt.tileVertexes, GPU_GEOMETRY_PRIM, repeatLastDraw, 1, storeIndex);
+                    gpu3dsDrawVertexList(&GPU3DSExt.rectangleVertexes, GPU_GEOMETRY_PRIM, repeatLastDraw, 2, storeIndex);
+                }
+                break;  // Exit loop - can't render stereo without targets
+            }
+
+            // Restore rendering state (targets already cleared above)
+            gpu3dsEnableAlphaBlending();
+            gpu3dsEnableDepthTest();
+
+            // DEBUG: Log first 5 draw calls per eye
+            static int drawLogCountLeft = 0, drawLogCountRight = 0;
+            if ((eye == 0 && drawLogCountLeft < 5) || (eye == 1 && drawLogCountRight < 5)) {
+                LOG_INFO("DRAW-DBG", ">>> DRAW eye=%s quads=%d tiles=%d rects=%d repeatLast=%d",
+                         eye == 0 ? "LEFT " : "RIGHT",
+                         GPU3DSExt.stereoQuadVertexes[eye].Count,
+                         GPU3DSExt.stereoTileVertexes[eye].Count,
+                         GPU3DSExt.rectangleVertexes.Count,
+                         repeatLastDraw);
+                if (eye == 0) drawLogCountLeft++; else drawLogCountRight++;
+            }
+
+            // Draw this eye's geometry (with per-layer depth offsets already baked into vertices)
+            gpu3dsDrawVertexList(&GPU3DSExt.stereoQuadVertexes[eye], GPU_TRIANGLES, repeatLastDraw, 0, storeIndex);
+            gpu3dsDrawVertexList(&GPU3DSExt.stereoTileVertexes[eye], GPU_GEOMETRY_PRIM, repeatLastDraw, 1, storeIndex);
+
+            // Rectangles (UI elements) stay at screen depth - draw from mono buffer for both eyes
+            // This ensures UI doesn't have parallax and remains comfortable to view
+            gpu3dsDrawVertexList(&GPU3DSExt.rectangleVertexes, GPU_GEOMETRY_PRIM, repeatLastDraw, 2, storeIndex);
+
+        }
+
+#ifdef DEBUG_STEREO_VERTEX_COUNTS
+        // Debug: Log vertex counts for both eyes
+        printf("[STEREO-DRAW] L_tiles=%d L_quads=%d | R_tiles=%d R_quads=%d\n",
+               GPU3DSExt.stereoTileVertexes[0].Count,
+               GPU3DSExt.stereoQuadVertexes[0].Count,
+               GPU3DSExt.stereoTileVertexes[1].Count,
+               GPU3DSExt.stereoQuadVertexes[1].Count);
+#endif
+        t3dsEndTiming(13);
+    }
+
+    t3dsEndTiming(11);
 }
 
 
@@ -195,10 +359,27 @@ void gpu3dsDrawMode7Vertexes(int fromIndex, int tileCount)
 
 void gpu3dsDrawMode7LineVertexes(bool repeatLastDraw, int storeIndex)
 {
-    if (GPU3DS.isReal3DS)
-        gpu3dsDrawVertexList(&GPU3DSExt.mode7LineVertexes, GPU_GEOMETRY_PRIM, repeatLastDraw, 3, storeIndex);
+    bool stereoEnabled = stereo3dsIsEnabled();
+    bool targetsReady = stereoEnabled ? stereo3dsAreTargetsCreated() : false;
+
+    if (stereoEnabled && targetsReady)
+    {
+        for (int eye = 0; eye < 2; ++eye)
+        {
+            stereo3dsSetActiveRenderTarget(eye == 0 ? STEREO_EYE_LEFT : STEREO_EYE_RIGHT);
+            if (GPU3DS.isReal3DS)
+                gpu3dsDrawVertexList(&GPU3DSExt.stereoMode7LineVertexes[eye], GPU_GEOMETRY_PRIM, repeatLastDraw, 3, storeIndex);
+            else
+                gpu3dsDrawVertexList(&GPU3DSExt.stereoMode7LineVertexes[eye], GPU_TRIANGLES, repeatLastDraw, 3, storeIndex);
+        }
+    }
     else
-        gpu3dsDrawVertexList(&GPU3DSExt.mode7LineVertexes, GPU_TRIANGLES, repeatLastDraw, 3, storeIndex);
+    {
+        if (GPU3DS.isReal3DS)
+            gpu3dsDrawVertexList(&GPU3DSExt.mode7LineVertexes, GPU_GEOMETRY_PRIM, repeatLastDraw, 3, storeIndex);
+        else
+            gpu3dsDrawVertexList(&GPU3DSExt.mode7LineVertexes, GPU_TRIANGLES, repeatLastDraw, 3, storeIndex);
+    }
 }
 
 

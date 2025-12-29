@@ -8,8 +8,8 @@
 #include "bufferedfilewriter.h"
 #include "port.h"
 
-#define GLOBAL_CONFIG_FILE_TARGET_VERSION   1.1f
-#define GAME_CONFIG_FILE_TARGET_VERSION     1
+#define GLOBAL_CONFIG_FILE_TARGET_VERSION   1.2f
+#define GAME_CONFIG_FILE_TARGET_VERSION     1.1f
 #define CONFIG_FILE_DEFAULT_VERSION         1
 
 float config3dsGetVersionFromFile(bool writeMode, bool isGameConfig, char *versionStringFromFile);
@@ -34,4 +34,3 @@ void    config3dsReadWriteBitmask(BufferedFileWriter& stream, bool writeMode,
                                   const char* name, uint32* bitmask, float versionFromFile = CONFIG_FILE_DEFAULT_VERSION);
 
 #endif
-

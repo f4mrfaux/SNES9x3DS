@@ -40,6 +40,7 @@
 #include "3dsimpl.h"
 #include "3dsimpl_tilecache.h"
 #include "3dsimpl_gpu.h"
+#include "3dsstereo.h"
 
 inline std::string operator "" s(const char* s, size_t length) {
     return std::string(s, length);
@@ -58,6 +59,14 @@ int frameCount = 0;
 int frameCount60 = 60;
 u64 frameCountTick = 0;
 int framesSkippedCount = 0;
+
+// Enhanced FPS tracking
+float currentFPS = 0.0f;
+float minFPS = 999.0f;
+float maxFPS = 0.0f;
+float avgFPS = 0.0f;
+int fpsHistoryCount = 0;
+float fpsHistorySum = 0.0f;
 
 // wait maxFramesForDialog before hiding dialog message
 // (60 frames = 1 second)
@@ -932,7 +941,53 @@ std::vector<SMenuItem> makeOptionMenu(std::vector<SMenuTab>& menuTab, int& curre
                   []( int val ) { CheckAndUpdate( settings3DS.ForceFrameRate, static_cast<EmulatedFramerate>(val) ); });
     AddMenuPicker(items, "  In-Frame Palette Changes"s, "Try changing this if some colors in the game look off."s, makeOptionsForInFramePaletteChanges(), settings3DS.PaletteFix, DIALOG_TYPE_INFO, true,
                   []( int val ) { CheckAndUpdate( settings3DS.PaletteFix, val ); });
-    
+
+    AddMenuHeader2(items, "Stereoscopic 3D"s);
+    AddMenuCheckbox(items, "  Enable 3D (Plan E)"s, settings3DS.EnableStereo3D,
+        []( int val ) { CheckAndUpdate( settings3DS.EnableStereo3D, static_cast<bool>(val) ); });
+
+    AddMenuGauge(items, "  Depth Strength"s, 25, 150, static_cast<int>(std::lround(settings3DS.StereoDepthStrength * 100.0f)),
+        []( int val ) { CheckAndUpdate( settings3DS.StereoDepthStrength, static_cast<float>(val) / 100.0f ); });
+
+    AddMenuGauge(items, "  Max Slider Depth"s, 0, 150, static_cast<int>(std::lround(settings3DS.StereoSliderValue * 100.0f)),
+        []( int val ) { CheckAndUpdate( settings3DS.StereoSliderValue, static_cast<float>(val) / 100.0f ); });
+
+    {
+        std::vector<std::pair<int, std::string>> planeOptions = {
+            {-1, "Auto (anchor mid depth)"},
+            {0,  "BG0 (foreground)"},
+            {1,  "BG1"},
+            {2,  "BG2"},
+            {3,  "BG3"},
+            {4,  "Sprites"}
+        };
+        std::vector<SMenuItem> planeItems;
+        for (int i = 0; i < planeOptions.size(); ++i) {
+            AddMenuDialogOption(planeItems, i, planeOptions[i].second, ""s);
+        }
+        int planeIndex = 0;
+        for (int i = 0; i < planeOptions.size(); ++i) {
+            if (planeOptions[i].first == settings3DS.ScreenPlaneLayer) {
+                planeIndex = i;
+                break;
+            }
+        }
+        AddMenuPicker(items, "  Screen Plane Anchor"s, "Choose which layer stays at screen depth (stabilizes parallax)"s, planeItems, planeIndex, DIALOG_TYPE_INFO, true,
+            [planeOptions]( int val ) {
+                if (val >= 0 && val < static_cast<int>(planeOptions.size()))
+                    CheckAndUpdate( settings3DS.ScreenPlaneLayer, planeOptions[val].first );
+            });
+    }
+
+    AddMenuCheckbox(items, "  Mode7 Depth Gradient"s, settings3DS.Mode7UseGradient,
+        []( int val ) { CheckAndUpdate( settings3DS.Mode7UseGradient, static_cast<bool>(val) ); });
+
+    AddMenuGauge(items, "  Mode7 Near Depth"s, -300, 300, static_cast<int>(std::lround(settings3DS.Mode7DepthNear * 10.0f)),
+        []( int val ) { CheckAndUpdate( settings3DS.Mode7DepthNear, static_cast<float>(val) / 10.0f ); });
+
+    AddMenuGauge(items, "  Mode7 Far Depth"s, -300, 300, static_cast<int>(std::lround(settings3DS.Mode7DepthFar * 10.0f)),
+        []( int val ) { CheckAndUpdate( settings3DS.Mode7DepthFar, static_cast<float>(val) / 10.0f ); });
+
     AddMenuDisabledOption(items, ""s);
 
     AddMenuHeader2(items, "Audio"s);
@@ -1301,6 +1356,41 @@ bool settingsReadWriteFullListByGame(bool writeMode)
     config3dsReadWriteInt32(stream, writeMode, "BindCirclePad=%d\n", &settings3DS.BindCirclePad, 0, 1);
     config3dsReadWriteInt32(stream, writeMode, "LastSaveSlot=%d\n", &settings3DS.CurrentSaveSlot, 0, 5);
 
+    // Stereo 3D (Plan E)
+    if (writeMode || detectedConfigVersion >= 1.1f) {
+        int enableStereo = settings3DS.EnableStereo3D ? 1 : 0;
+        config3dsReadWriteInt32(stream, writeMode, "EnableStereo3D=%d\n", &enableStereo, 0, 1);
+        settings3DS.EnableStereo3D = (enableStereo != 0);
+
+        int stereoStrength = static_cast<int>(std::lround(settings3DS.StereoDepthStrength * 100.0f));
+        config3dsReadWriteInt32(stream, writeMode, "StereoDepthStrength=%d\n", &stereoStrength, 25, 200);
+        settings3DS.StereoDepthStrength = static_cast<float>(stereoStrength) / 100.0f;
+
+        int stereoSlider = static_cast<int>(std::lround(settings3DS.StereoSliderValue * 100.0f));
+        config3dsReadWriteInt32(stream, writeMode, "StereoSliderValue=%d\n", &stereoSlider, 0, 200);
+        settings3DS.StereoSliderValue = static_cast<float>(stereoSlider) / 100.0f;
+
+        config3dsReadWriteInt32(stream, writeMode, "ScreenPlaneLayer=%d\n", &settings3DS.ScreenPlaneLayer, -1, 4);
+
+        for (int i = 0; i < 5; ++i) {
+            int depthTenth = static_cast<int>(std::lround(settings3DS.LayerDepth[i] * 10.0f));
+            std::ostringstream oss;
+            oss << "LayerDepth" << i << "=%d\n";
+            config3dsReadWriteInt32(stream, writeMode, oss.str().c_str(), &depthTenth, -300, 300);
+            settings3DS.LayerDepth[i] = static_cast<float>(depthTenth) / 10.0f;
+        }
+
+        int m7Near = static_cast<int>(std::lround(settings3DS.Mode7DepthNear * 10.0f));
+        int m7Far  = static_cast<int>(std::lround(settings3DS.Mode7DepthFar  * 10.0f));
+        config3dsReadWriteInt32(stream, writeMode, "Mode7DepthNear=%d\n", &m7Near, -500, 500);
+        config3dsReadWriteInt32(stream, writeMode, "Mode7DepthFar=%d\n",  &m7Far,  -500, 500);
+        settings3DS.Mode7DepthNear = static_cast<float>(m7Near) / 10.0f;
+        settings3DS.Mode7DepthFar  = static_cast<float>(m7Far)  / 10.0f;
+        int mode7Gradient = settings3DS.Mode7UseGradient ? 1 : 0;
+        config3dsReadWriteInt32(stream, writeMode, "Mode7UseGradient=%d\n", &mode7Gradient, 0, 1);
+        settings3DS.Mode7UseGradient = (mode7Gradient != 0);
+    }
+
     static const char *buttonName[10] = {"A", "B", "X", "Y", "L", "R", "ZL", "ZR", "SELECT","START"};
     for (int i = 0; i < 10; ++i) {
         for (int j = 0; j < 3; ++j) {
@@ -1368,6 +1458,41 @@ bool settingsReadWriteFullListGlobal(bool writeMode)
     config3dsReadWriteInt32(stream, writeMode, "GameBorderOpacity=%d\n", &settings3DS.GameBorderOpacity, 1, OPACITY_STEPS);
     config3dsReadWriteInt32(stream, writeMode, "Disable3DSlider=%d\n", &settings3DS.Disable3DSlider, 0, 1);
     config3dsReadWriteInt32(stream, writeMode, "Font=%d\n", &settings3DS.Font, 0, 2);
+
+    // Stereo 3D (Plan E) defaults
+    if (writeMode || detectedConfigVersion >= 1.2f) {
+        int enableStereo = settings3DS.EnableStereo3D ? 1 : 0;
+        config3dsReadWriteInt32(stream, writeMode, "EnableStereo3D=%d\n", &enableStereo, 0, 1);
+        settings3DS.EnableStereo3D = (enableStereo != 0);
+
+        int stereoStrength = static_cast<int>(std::lround(settings3DS.StereoDepthStrength * 100.0f));
+        config3dsReadWriteInt32(stream, writeMode, "StereoDepthStrength=%d\n", &stereoStrength, 25, 200);
+        settings3DS.StereoDepthStrength = static_cast<float>(stereoStrength) / 100.0f;
+
+        int stereoSlider = static_cast<int>(std::lround(settings3DS.StereoSliderValue * 100.0f));
+        config3dsReadWriteInt32(stream, writeMode, "StereoSliderValue=%d\n", &stereoSlider, 0, 200);
+        settings3DS.StereoSliderValue = static_cast<float>(stereoSlider) / 100.0f;
+
+        config3dsReadWriteInt32(stream, writeMode, "ScreenPlaneLayer=%d\n", &settings3DS.ScreenPlaneLayer, -1, 4);
+
+        for (int i = 0; i < 5; ++i) {
+            int depthTenth = static_cast<int>(std::lround(settings3DS.LayerDepth[i] * 10.0f));
+            std::ostringstream oss;
+            oss << "LayerDepth" << i << "=%d\n";
+            config3dsReadWriteInt32(stream, writeMode, oss.str().c_str(), &depthTenth, -300, 300);
+            settings3DS.LayerDepth[i] = static_cast<float>(depthTenth) / 10.0f;
+        }
+
+        int m7Near = static_cast<int>(std::lround(settings3DS.Mode7DepthNear * 10.0f));
+        int m7Far  = static_cast<int>(std::lround(settings3DS.Mode7DepthFar  * 10.0f));
+        config3dsReadWriteInt32(stream, writeMode, "Mode7DepthNear=%d\n", &m7Near, -500, 500);
+        config3dsReadWriteInt32(stream, writeMode, "Mode7DepthFar=%d\n",  &m7Far,  -500, 500);
+        settings3DS.Mode7DepthNear = static_cast<float>(m7Near) / 10.0f;
+        settings3DS.Mode7DepthFar  = static_cast<float>(m7Far)  / 10.0f;
+        int mode7Gradient = settings3DS.Mode7UseGradient ? 1 : 0;
+        config3dsReadWriteInt32(stream, writeMode, "Mode7UseGradient=%d\n", &mode7Gradient, 0, 1);
+        settings3DS.Mode7UseGradient = (mode7Gradient != 0);
+    }
     
     // Fixes the bug where we have spaces in the directory name
     config3dsReadWriteString(stream, writeMode, "DefaultDir=%s\n", "DefaultDir=%1000[^\n]\n", settings3DS.defaultDir);
@@ -2140,12 +2265,36 @@ void updateSecondScreenContent()
 
         if (settings3DS.SecondScreenContent == CONTENT_INFO) {
             float timeDelta = ((float)(newTick - frameCountTick))/TICKS_PER_SEC;
-            int fpsmul10 = (int)((float)600 / timeDelta);
+            currentFPS = (float)60 / timeDelta;
 
+            // Update min/max/avg tracking
+            if (currentFPS < minFPS) minFPS = currentFPS;
+            if (currentFPS > maxFPS) maxFPS = currentFPS;
+            fpsHistorySum += currentFPS;
+            fpsHistoryCount++;
+            avgFPS = fpsHistorySum / fpsHistoryCount;
+
+            // Reset stats every 10 minutes (600 samples = 10 minutes)
+            if (fpsHistoryCount >= 600) {
+                fpsHistoryCount = 0;
+                fpsHistorySum = 0.0f;
+                minFPS = currentFPS;
+                maxFPS = currentFPS;
+            }
+
+            // Detect stereo/mono mode
+            bool stereoEnabled = stereo3dsIsEnabled() && (stereo3dsGetSliderValue() >= 0.01f);
+            const char* modeStr = stereoEnabled ? "3D" : "2D";
+
+            // Format FPS display with mode indicator and stats
             if (framesSkippedCount)
-                snprintf (frameCountBuffer, 69, "FPS: %2d.%1d (%d skipped)", fpsmul10 / 10, fpsmul10 % 10, framesSkippedCount);
+                snprintf (frameCountBuffer, 69, "%s %2d.%1d (%d skip) [%2.0f-%2.0f avg%2.0f]",
+                         modeStr, (int)currentFPS, (int)(currentFPS * 10) % 10, framesSkippedCount,
+                         minFPS, maxFPS, avgFPS);
             else
-                snprintf (frameCountBuffer, 69, "FPS: %2d.%1d", fpsmul10 / 10, fpsmul10 % 10);
+                snprintf (frameCountBuffer, 69, "%s %2d.%1d fps [min%2.0f max%2.0f avg%2.0f]",
+                         modeStr, (int)currentFPS, (int)(currentFPS * 10) % 10,
+                         minFPS, maxFPS, avgFPS);
 
             if (ui3dsGetSecondScreenDialogState() == HIDDEN) {
                 float alpha = (float)(settings3DS.SecondScreenOpacity) / OPACITY_STEPS;
@@ -2153,7 +2302,7 @@ void updateSecondScreenContent()
                 menu3dsSetFpsInfo(framesSkippedCount ? Themes[settings3DS.Theme].dialogColorWarn : 0xFFFFFF, alpha, frameCountBuffer);
             }
         }
-        
+
         frameCount60 = 60;
         framesSkippedCount = 0;
 
